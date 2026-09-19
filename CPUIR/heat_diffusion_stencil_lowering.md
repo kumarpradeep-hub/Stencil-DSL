@@ -27,6 +27,10 @@ with **Dirichlet boundary conditions** (`boundary_value = 0.0`) applied at the d
 
 ## Stage-by-Stage IR
 
+Each stage below shows the **complete** IR emitted at that point, followed by an explicit **Changed** / **Unchanged** breakdown relative to the previous stage.
+
+---
+
 ### Stage 0 — Input (parsed/canonicalized)
 
 ```mlir
@@ -48,13 +52,45 @@ module {
 }
 ```
 
-### Stages 1 & 4 — Fusion / Tile-Fuse (no-ops)
+**Changed (vs. raw hand-written source):**
+- SSA value names normalized to `%0, %1, %2, ...` instead of the original `%u_t`, `%result`, `%v0`, etc.
+- Type spelling canonicalized: `!stencil.field<[4096]xf64>` → `<[4096]x f64>` at use sites (generic printer form).
 
-Both the cross-kernel/local fusion pass and the tile-fuse pass leave the IR **unchanged**, since the module contains a single `stencil.apply` with no fusable sibling or nested tiling structure.
+**Unchanged:**
+- Overall structure: one `stencil.load`, one `stencil.apply` (3-point stencil body), one `stencil.store`.
+- All attributes (`boundary_condition = "dirichlet"`, `boundary_value = 0.0`).
+- No module-level attributes yet.
 
-### Stage 2 — Structural Analysis
+---
 
-Halo inference and boundary-condition modeling annotate the `stencil.apply` and the enclosing module:
+### Stage 1 — Fusion (`--stencil-cross-kernel-fusion --stencil-local-fusion`)
+
+```mlir
+module {
+  func.func @heat_diffusion(%arg0: !stencil.field<[4096]x f64>, %arg1: !stencil.field<[4096]x f64>) {
+    %0 = stencil.load %arg0 : <[4096]x f64> -> <[4096]x f64>
+    %1 = stencil.apply(%arg2 = %0 : !stencil.temp<[4096]x f64>) -> !stencil.temp<[4096]x f64>
+        attributes {stencil.boundary_condition = "dirichlet", stencil.boundary_value = 0.000000e+00 : f64} {
+      %2 = stencil.access %arg2 [-1] : (!stencil.temp<[4096]x f64>) -> f64
+      %3 = stencil.access %arg2 [0]  : (!stencil.temp<[4096]x f64>) -> f64
+      %4 = arith.addf %2, %3 : f64
+      %5 = stencil.access %arg2 [1]  : (!stencil.temp<[4096]x f64>) -> f64
+      %6 = arith.addf %4, %5 : f64
+      stencil.return %6 : f64
+    }
+    stencil.store %1 to %arg1 : <[4096]x f64> to <[4096]x f64>
+    return
+  }
+}
+```
+
+**Changed:** nothing — IR is byte-for-byte identical to Stage 0.
+
+**Unchanged:** everything. There is only a single `stencil.apply` in the module, so cross-kernel fusion has no second kernel to fuse with, and local fusion finds no duplicate/redundant sub-computations inside the one apply body to merge.
+
+---
+
+### Stage 2 — Structural Analysis (`--stencil-infer-halo --stencil-model-boundary-conditions --stencil-select-decomposition-strategy --stencil-decide-bounds-mode`)
 
 ```mlir
 module attributes {stencil.bounds_mode = "static", stencil.decomposition_strategy = "single_rank"} {
@@ -63,7 +99,12 @@ module attributes {stencil.bounds_mode = "static", stencil.decomposition_strateg
     %1 = stencil.apply(%arg2 = %0 : !stencil.temp<[4096]x f64>) -> !stencil.temp<[4096]x f64>
         attributes {stencil.boundary_condition = "dirichlet", stencil.boundary_value = 0.000000e+00 : f64,
                     stencil.halo = array<i64: 1>} {
-      ...
+      %2 = stencil.access %arg2 [-1] : (!stencil.temp<[4096]x f64>) -> f64
+      %3 = stencil.access %arg2 [0]  : (!stencil.temp<[4096]x f64>) -> f64
+      %4 = arith.addf %2, %3 : f64
+      %5 = stencil.access %arg2 [1]  : (!stencil.temp<[4096]x f64>) -> f64
+      %6 = arith.addf %4, %5 : f64
+      stencil.return %6 : f64
     }
     stencil.store %1 to %arg1 : <[4096]x f64> to <[4096]x f64>
     return
@@ -71,53 +112,143 @@ module attributes {stencil.bounds_mode = "static", stencil.decomposition_strateg
 }
 ```
 
-Key additions:
-- **`stencil.halo = array<i64: 1>`** — a halo of 1 element is required on each side, derived from the `[-1]`/`[1]` access offsets.
-- **`stencil.bounds_mode = "static"`** — domain bounds (4096) are known at compile time.
-- **`stencil.decomposition_strategy = "single_rank"`** — no multi-rank/distributed decomposition needed; runs on a single rank.
+**Changed:**
+- **Module attributes added:** `stencil.bounds_mode = "static"` and `stencil.decomposition_strategy = "single_rank"` attached to the top-level `module`.
+- **`stencil.apply` attribute added:** `stencil.halo = array<i64: 1>`, computed by walking the `stencil.access` offsets (`[-1]`, `[0]`, `[1]`) inside the apply body and taking the max absolute offset (`1`) per axis.
 
-### Stage 5 — Lowering to `memref` / `scf`
+**Unchanged:**
+- The `stencil.apply` body itself (all `stencil.access`/`arith.addf`/`stencil.return` ops) — this pass only annotates, it does not rewrite computation.
+- `stencil.load` / `stencil.store` ops.
+- The pre-existing `boundary_condition` / `boundary_value` attributes (only read/modeled here, not altered).
 
-The abstract stencil apply is split into **three explicit loops**:
+---
 
-1. **Interior loop** (`i = 1 .. 4094`): the 3-point stencil computed from real neighbor loads.
-2. **Left boundary loop** (`i = 0 .. 0`): writes the Dirichlet constant `0.0`.
-3. **Right boundary loop** (`i = 4095 .. 4095`): writes the Dirichlet constant `0.0`.
+### Stage 4 — Tile-Fuse (`--stencil-tile-fuse`)
+
+```mlir
+module attributes {stencil.bounds_mode = "static", stencil.decomposition_strategy = "single_rank"} {
+  func.func @heat_diffusion(%arg0: !stencil.field<[4096]x f64>, %arg1: !stencil.field<[4096]x f64>) {
+    %0 = stencil.load %arg0 : <[4096]x f64> -> <[4096]x f64>
+    %1 = stencil.apply(%arg2 = %0 : !stencil.temp<[4096]x f64>) -> !stencil.temp<[4096]x f64>
+        attributes {stencil.boundary_condition = "dirichlet", stencil.boundary_value = 0.000000e+00 : f64,
+                    stencil.halo = array<i64: 1>} {
+      %2 = stencil.access %arg2 [-1] : (!stencil.temp<[4096]x f64>) -> f64
+      %3 = stencil.access %arg2 [0]  : (!stencil.temp<[4096]x f64>) -> f64
+      %4 = arith.addf %2, %3 : f64
+      %5 = stencil.access %arg2 [1]  : (!stencil.temp<[4096]x f64>) -> f64
+      %6 = arith.addf %4, %5 : f64
+      stencil.return %6 : f64
+    }
+    stencil.store %1 to %arg1 : <[4096]x f64> to <[4096]x f64>
+    return
+  }
+}
+```
+
+**Changed:** nothing — IR is byte-for-byte identical to Stage 2.
+
+**Unchanged:** everything. Tile-fuse merges tiled loop nests that share iteration space after tiling; there is no tiling structure yet at this point (that only appears after lowering to loops), and only a single apply exists, so the pass is a no-op on this kernel.
+
+> **Note:** `stage 3` is intentionally absent from the numbered trace — the pipeline's internal pass numbering skips from `2` to `4` here (no separate dumped stage exists between structural analysis and tile-fuse for this run).
+
+---
+
+### Stage 5 — Lowering to `memref` / `scf` (`--stencil-to-memref`)
 
 ```mlir
 module attributes {stencil.bounds_mode = "static", stencil.decomposition_strategy = "single_rank"} {
   func.func @heat_diffusion(%arg0: memref<4096xf64>, %arg1: memref<4096xf64>) {
-    // Interior: out[i] = u[i-1] + u[i] + u[i+1]
-    scf.for %arg2 = %c1 to %c4095 step %c1 {
+    %c1 = arith.constant 1 : index
+    %c4095 = arith.constant 4095 : index
+    %c1_0 = arith.constant 1 : index
+    scf.for %arg2 = %c1 to %c4095 step %c1_0 {
+      %c-1 = arith.constant -1 : index
       %0 = arith.addi %arg2, %c-1 : index
-      %1 = memref.load %arg0[%0]    : memref<4096xf64>
+      %1 = memref.load %arg0[%0] : memref<4096xf64>
       %2 = memref.load %arg0[%arg2] : memref<4096xf64>
       %3 = arith.addf %1, %2 : f64
-      %4 = arith.addi %arg2, %c1 : index
+      %c1_5 = arith.constant 1 : index
+      %4 = arith.addi %arg2, %c1_5 : index
       %5 = memref.load %arg0[%4] : memref<4096xf64>
       %6 = arith.addf %3, %5 : f64
       memref.store %6, %arg1[%arg2] : memref<4096xf64>
     }
-
-    // Left Dirichlet boundary: out[0] = 0.0
-    scf.for %arg2 = %c0 to %c1 step %c1 {
-      memref.store %cst_0, %arg1[%arg2] : memref<4096xf64>
+    %c0 = arith.constant 0 : index
+    %c1_1 = arith.constant 1 : index
+    %c1_2 = arith.constant 1 : index
+    scf.for %arg2 = %c0 to %c1_1 step %c1_2 {
+      %cst = arith.constant 0.000000e+00 : f64
+      memref.store %cst, %arg1[%arg2] : memref<4096xf64>
     }
-
-    // Right Dirichlet boundary: out[4095] = 0.0
-    scf.for %arg2 = %c4095 to %c4096 step %c1 {
-      memref.store %cst_0, %arg1[%arg2] : memref<4096xf64>
+    %c4095_3 = arith.constant 4095 : index
+    %c4096 = arith.constant 4096 : index
+    %c1_4 = arith.constant 1 : index
+    scf.for %arg2 = %c4095_3 to %c4096 step %c1_4 {
+      %cst = arith.constant 0.000000e+00 : f64
+      memref.store %cst, %arg1[%arg2] : memref<4096xf64>
     }
     return
   }
 }
 ```
 
-> Note: the single-trip boundary loops (`scf.for %arg2 = %c0 to %c1 step %c1`) are structurally loops but execute exactly once; a later canonicalization pass would typically simplify these into plain `memref.store` ops.
+**Changed — this is the largest transformation in the pipeline:**
+- **Types:** `!stencil.field<[4096]x f64>` → `memref<4096xf64>` for both arguments; `!stencil.temp<...>` is eliminated entirely.
+- **Ops eliminated:** `stencil.load`, `stencil.store`, `stencil.apply`, `stencil.access`, `stencil.return` all disappear.
+- **Ops introduced:** `scf.for` (×3), `arith.constant` (index and f64 constants for bounds/offsets/boundary value), `arith.addi` (index arithmetic for `i-1`/`i+1`), `memref.load`, `memref.store`.
+- **Control flow introduced:** the single abstract `stencil.apply` becomes **three separate loops**:
+  1. Interior loop, `i ∈ [1, 4095)`: real 3-point stencil (`memref.load` at `i-1`, `i`, `i+1`; `arith.addf` ×2; `memref.store` at `i`).
+  2. Left boundary loop, `i ∈ [0, 1)`: stores the Dirichlet constant `0.0` — derived directly from `stencil.boundary_value` and the halo of `1`.
+  3. Right boundary loop, `i ∈ [4095, 4096)`: stores the Dirichlet constant `0.0`, symmetric to the left boundary.
 
-### Stage 6 — Vectorization
+**Unchanged:**
+- The module-level attributes (`bounds_mode`, `decomposition_strategy`) are carried through unmodified.
+- The underlying arithmetic being performed (still `u[i-1] + u[i] + u[i+1]` for interior points, `0.0` at the two boundary points) — semantics preserved, only representation changes.
 
-`--stencil-vectorize --stencil-map-to-matrix-units` runs but produces **no change** to the IR. The interior loop has loop-carried, offset (`i-1`, `i`, `i+1`) scalar memory accesses over a 1D array — at this size/shape the pass does not find a profitable SIMD/matrix-unit mapping, so the scalar `scf.for` loop nest from Stage 5 is preserved as-is.
+---
+
+### Stage 6 — Vectorization (`--stencil-vectorize --stencil-map-to-matrix-units`)
+
+```mlir
+module attributes {stencil.bounds_mode = "static", stencil.decomposition_strategy = "single_rank"} {
+  func.func @heat_diffusion(%arg0: memref<4096xf64>, %arg1: memref<4096xf64>) {
+    %c1 = arith.constant 1 : index
+    %c4095 = arith.constant 4095 : index
+    %c1_0 = arith.constant 1 : index
+    scf.for %arg2 = %c1 to %c4095 step %c1_0 {
+      %c-1 = arith.constant -1 : index
+      %0 = arith.addi %arg2, %c-1 : index
+      %1 = memref.load %arg0[%0] : memref<4096xf64>
+      %2 = memref.load %arg0[%arg2] : memref<4096xf64>
+      %3 = arith.addf %1, %2 : f64
+      %c1_5 = arith.constant 1 : index
+      %4 = arith.addi %arg2, %c1_5 : index
+      %5 = memref.load %arg0[%4] : memref<4096xf64>
+      %6 = arith.addf %3, %5 : f64
+      memref.store %6, %arg1[%arg2] : memref<4096xf64>
+    }
+    %c0 = arith.constant 0 : index
+    %c1_1 = arith.constant 1 : index
+    %c1_2 = arith.constant 1 : index
+    scf.for %arg2 = %c0 to %c1_1 step %c1_2 {
+      %cst = arith.constant 0.000000e+00 : f64
+      memref.store %cst, %arg1[%arg2] : memref<4096xf64>
+    }
+    %c4095_3 = arith.constant 4095 : index
+    %c4096 = arith.constant 4096 : index
+    %c1_4 = arith.constant 1 : index
+    scf.for %arg2 = %c4095_3 to %c4096 step %c1_4 {
+      %cst = arith.constant 0.000000e+00 : f64
+      memref.store %cst, %arg1[%arg2] : memref<4096xf64>
+    }
+    return
+  }
+}
+```
+
+**Changed:** nothing — IR is byte-for-byte identical to Stage 5.
+
+**Unchanged:** everything. `--stencil-vectorize` and `--stencil-map-to-matrix-units` run over the loop nest but do not rewrite it here: the interior loop's memory accesses are offset by a loop-carried induction variable (`i-1`, `i`, `i+1`) in a 1D scalar-store pattern, and the pass finds no profitable SIMD width / matrix-unit mapping to apply at this shape, so all three `scf.for` loops, and every op inside them, are passed through unchanged.
 
 ## Summary
 
